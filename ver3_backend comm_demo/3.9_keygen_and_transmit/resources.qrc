@@ -1,0 +1,20 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/Main.qml</file>
+        
+        <file>qml/components/AppButton.qml</file>
+        <file>qml/components/AppHeader.qml</file>
+        <file>qml/components/AppTextField.qml</file>
+        <file>qml/components/LoadingSpinner.qml</file>
+
+        <file>qml/pages/ConnectPage.qml</file>
+        <file>qml/pages/ConnectLoadingPage.qml</file>
+        <file>qml/pages/UploadPage.qml</file>
+        <file>qml/pages/ActionPage.qml</file>
+        <file>qml/pages/WorkLoadingPage.qml</file>
+        <file>qml/pages/RegenerateKeyPage.qml</file>
+
+        <file>qml/styles/Theme.qml</file>
+        <file>qml/styles/qmldir</file>
+    </qresource>
+</RCC>
