@@ -68,14 +68,6 @@ public:
                         QString *resultData,
                         QString *errorMessage);         // non-const: 세션 소켓 사용
 
-    // 대용량 데이터(이미지 등) 청크 전송용
-    bool sendBulkKeyCommand(const QString &userId,
-                            const QString &mode,
-                            const QString &keyNumber,
-                            const QByteArray &payload,
-                            QString *resultData,
-                            QString *errorMessage);
-
     // ── 세션 관리 ───────────────────────────────────────────────────────────
     bool hasActiveSession() const;
     void closeSession();    // SESSION_CLOSE 전송 후 소켓 닫기

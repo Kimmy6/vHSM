@@ -16,6 +16,8 @@ constexpr quint16 kPiPort           = 5000;
 constexpr int     kConnectTimeoutMs = 5000;
 constexpr int     kWriteTimeoutMs   = 3000;
 constexpr int     kReadTimeoutMs    = 15000;
+constexpr int     kKeyWriteTimeoutMs = 30000;  // 이미지 Base64 전송용
+constexpr int     kKeyReadTimeoutMs  = 60000;  // LED(3s) + 카메라 + 암복호화 여유
 }
 
 
@@ -351,9 +353,32 @@ bool PiGatewayService::sendKeyCommand(const QString &userId,
     const QString command = QStringLiteral("KEY_COMMAND:%1:%2:%3:%4")
         .arg(trimmedUser, trimmedMode, trimmedKey, data.trimmed());
 
-    QString reply;
-    if (!sendSessionCommand(command, &reply, errorMessage))
+    if (!hasActiveSession()) {
+        if (errorMessage) *errorMessage = QStringLiteral("세션이 없습니다. 다시 인증해주세요.");
         return false;
+    }
+
+    const QByteArray payload = (command + QStringLiteral("\n")).toUtf8();
+    if (m_session->write(payload) == -1 || !m_session->waitForBytesWritten(kKeyWriteTimeoutMs)) {
+        if (errorMessage) *errorMessage = QStringLiteral("키 명령 전송에 실패했습니다.");
+        return false;
+    }
+
+    QByteArray buf;
+    while (true) {
+        if (!m_session->waitForReadyRead(kKeyReadTimeoutMs)) {
+            if (buf.isEmpty()) {
+                if (errorMessage) *errorMessage = QStringLiteral("키 명령 응답 대기 시간이 초과되었습니다.");
+                return false;
+            }
+            break;
+        }
+        buf += m_session->readAll();
+        if (buf.contains('\n')) break;
+    }
+
+    const int nl = buf.indexOf('\n');
+    QString reply = QString::fromUtf8(nl >= 0 ? buf.left(nl) : buf).trimmed();
 
     // 암호화 응답: KEY_ENCRYPT_OK:<ciphertext_hex>:<iv_hex>
     if (trimmedMode == QStringLiteral("encrypt") && reply.startsWith(QStringLiteral("KEY_ENCRYPT_OK:"))) {
@@ -370,126 +395,6 @@ bool PiGatewayService::sendKeyCommand(const QString &userId,
 
     if (errorMessage)
         *errorMessage = reply.isEmpty() ? QStringLiteral("키 명령 처리에 실패했습니다.") : reply;
-    return false;
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 대용량 데이터 청크 전송 (이미지 암복호화용)
-// 프로토콜:
-//   Qt  →  Pi : KEY_BULK_BEGIN:<user>:<mode>:<key>:<total_bytes>\n
-//   Pi  →  Qt : BULK_READY\n
-//   Qt  →  Pi : <chunk1_base64>\n  (4096 바이트씩)
-//   Pi  →  Qt : CHUNK_OK\n
-//   ...반복...
-//   Qt  →  Pi : KEY_BULK_END\n
-//   Pi  →  Qt : KEY_ENCRYPT_OK:<ct_hex>:<iv_hex>\n
-//              또는 KEY_DECRYPT_OK:<plaintext_b64>\n
-// ─────────────────────────────────────────────────────────────────────────────
-bool PiGatewayService::sendBulkKeyCommand(const QString &userId,
-                                           const QString &mode,
-                                           const QString &keyNumber,
-                                           const QByteArray &payload,
-                                           QString *resultData,
-                                           QString *errorMessage)
-{
-    if (!hasActiveSession()) {
-        if (errorMessage) *errorMessage = QStringLiteral("활성 세션이 없습니다. 다시 인증해주세요.");
-        return false;
-    }
-
-    constexpr int kChunkSize = 4096;  // 4KB 청크
-
-    // ── 1. BEGIN 전송 ──────────────────────────────────────────────────────
-    const QString beginCmd = QStringLiteral("KEY_BULK_BEGIN:%1:%2:%3:%4\n")
-        .arg(userId, mode, keyNumber, QString::number(payload.size()));
-
-    if (m_session->write(beginCmd.toUtf8()) == -1 ||
-        !m_session->waitForBytesWritten(kWriteTimeoutMs)) {
-        if (errorMessage) *errorMessage = QStringLiteral("BULK BEGIN 전송 실패");
-        return false;
-    }
-
-    // BULK_READY 대기
-    QString reply;
-    {
-        QByteArray buf;
-        while (!buf.contains('\n')) {
-            if (!m_session->waitForReadyRead(kReadTimeoutMs)) {
-                if (errorMessage) *errorMessage = QStringLiteral("BULK_READY 응답 타임아웃");
-                return false;
-            }
-            buf += m_session->readAll();
-        }
-        reply = QString::fromUtf8(buf.left(buf.indexOf('\n'))).trimmed();
-    }
-    if (reply != QStringLiteral("BULK_READY")) {
-        if (errorMessage) *errorMessage = QStringLiteral("BULK_READY 수신 실패: ") + reply;
-        return false;
-    }
-
-    // ── 2. 청크 전송 ──────────────────────────────────────────────────────
-    int offset = 0;
-    while (offset < payload.size()) {
-        const QByteArray chunk      = payload.mid(offset, kChunkSize);
-        const QByteArray chunkB64   = chunk.toBase64();
-        const QByteArray chunkLine  = chunkB64 + '\n';
-
-        if (m_session->write(chunkLine) == -1 ||
-            !m_session->waitForBytesWritten(kWriteTimeoutMs)) {
-            if (errorMessage) *errorMessage = QStringLiteral("청크 전송 실패 (offset=%1)").arg(offset);
-            return false;
-        }
-
-        // CHUNK_OK 대기
-        QByteArray buf;
-        while (!buf.contains('\n')) {
-            if (!m_session->waitForReadyRead(kReadTimeoutMs)) {
-                if (errorMessage) *errorMessage = QStringLiteral("CHUNK_OK 응답 타임아웃");
-                return false;
-            }
-            buf += m_session->readAll();
-        }
-        const QString chunkReply = QString::fromUtf8(buf.left(buf.indexOf('\n'))).trimmed();
-        if (chunkReply != QStringLiteral("CHUNK_OK")) {
-            if (errorMessage) *errorMessage = QStringLiteral("CHUNK_OK 수신 실패: ") + chunkReply;
-            return false;
-        }
-
-        offset += kChunkSize;
-    }
-
-    // ── 3. END 전송 ───────────────────────────────────────────────────────
-    if (m_session->write("KEY_BULK_END\n") == -1 ||
-        !m_session->waitForBytesWritten(kWriteTimeoutMs)) {
-        if (errorMessage) *errorMessage = QStringLiteral("BULK END 전송 실패");
-        return false;
-    }
-
-    // ── 4. 최종 결과 수신 ─────────────────────────────────────────────────
-    QByteArray buf;
-    while (!buf.contains('\n')) {
-        if (!m_session->waitForReadyRead(30000)) {  // 암복호화 처리 여유 30초
-            if (errorMessage) *errorMessage = QStringLiteral("최종 응답 타임아웃");
-            return false;
-        }
-        buf += m_session->readAll();
-    }
-    const QString finalReply = QString::fromUtf8(buf.left(buf.indexOf('\n'))).trimmed();
-
-    if (finalReply.startsWith(QStringLiteral("KEY_ENCRYPT_OK:"))) {
-        if (resultData) *resultData = finalReply.mid(15); // "KEY_ENCRYPT_OK:" 제거
-        if (errorMessage) errorMessage->clear();
-        return true;
-    }
-    if (finalReply.startsWith(QStringLiteral("KEY_DECRYPT_OK:"))) {
-        if (resultData) *resultData = finalReply.mid(15);
-        if (errorMessage) errorMessage->clear();
-        return true;
-    }
-
-    if (errorMessage) *errorMessage = finalReply.isEmpty()
-        ? QStringLiteral("알 수 없는 응답") : finalReply;
     return false;
 }
 

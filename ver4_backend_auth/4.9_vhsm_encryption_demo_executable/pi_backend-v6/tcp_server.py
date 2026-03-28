@@ -425,17 +425,33 @@ def capture_and_extract_key() -> "bytes | None":
         log_backend_error(f"TIFF 이미지 로드 실패: {capture_tiff}")
         return None
 
+    # [DEBUG] 원본 그레이스케일 저장
+    cv2.imwrite("/home/pi/debug_1_gray.jpg", img)
+    log_backend_info(f"[DEBUG] 원본 그레이스케일 저장 → /home/pi/debug_1_gray.jpg  shape={img.shape}  min={img.min()} max={img.max()} mean={img.mean():.1f}")
+
     # Step 4: 리사이즈 (1280×960)
     img = cv2.resize(img, (1280, 960), interpolation=cv2.INTER_LINEAR)
+
+    # [DEBUG] 리사이즈 후 저장
+    cv2.imwrite("/home/pi/debug_2_resized.jpg", img)
+    log_backend_info(f"[DEBUG] 리사이즈 후 저장 → /home/pi/debug_2_resized.jpg  shape={img.shape}")
 
     # Step 5: 50% 임계값 이진화
     threshold_val = int(255 * 0.5)
     flat = img.flatten().tolist()
     raw_bits = [1 if px >= threshold_val else 0 for px in flat]
+    log_backend_info(f"[DEBUG] 이진화 완료 - raw_bits={len(raw_bits)}, 1의 비율={sum(raw_bits)/len(raw_bits):.4f}")
+
+    # [DEBUG] 이진화 이미지 저장
+    import numpy as np
+    binary_img = np.array(raw_bits, dtype=np.uint8).reshape(960, 1280) * 255
+    cv2.imwrite("/home/pi/debug_3_binary.jpg", binary_img)
+    log_backend_info(f"[DEBUG] 이진화 이미지 저장 → /home/pi/debug_3_binary.jpg")
 
     # Step 6: 2-pass Von Neumann debiasing
     pass1    = _von_neumann_pass(raw_bits)
     out_bits = _von_neumann_pass(pass1)
+    log_backend_info(f"[DEBUG] Von Neumann 1pass={len(pass1)}bits, 2pass={len(out_bits)}bits")
 
     KEY_BITS = 24 * 8  # AES-192 = 192비트
     if len(out_bits) < KEY_BITS:
@@ -653,102 +669,6 @@ def handle_command(command: str) -> str:
 
 # ─── 소켓 수신 ───────────────────────────────────────────────────────────────
 
-# ─── 대용량 청크 수신 + 암복호화 ─────────────────────────────────────────────
-#
-# 프로토콜:
-#   Qt  → Pi : KEY_BULK_BEGIN:<user>:<mode>:<key>:<total_bytes>\n
-#   Pi  → Qt : BULK_READY\n
-#   Qt  → Pi : <chunk_base64>\n  (반복)
-#   Qt  → Pi : KEY_BULK_END\n
-#   Pi  → Qt : KEY_ENCRYPT_OK:<ct_hex>:<iv_hex>\n
-#           또는 KEY_DECRYPT_OK:<plaintext_b64>\n
-
-def handle_bulk_key_command(conn: "ssl.SSLSocket", header: str) -> str:
-    """
-    header 예시: "KEY_BULK_BEGIN:alice:encrypt:1:204800"
-    청크들을 수신해 조립한 뒤 암복호화 수행 후 결과 반환.
-    """
-    parts = header.split(":", 4)
-    if len(parts) != 5:
-        return "ERROR: INVALID_BULK_HEADER"
-
-    user_id    = parts[1].strip() or "User"
-    mode       = parts[2].strip().lower()
-    key_number = parts[3].strip()
-    try:
-        total_bytes = int(parts[4].strip())
-    except ValueError:
-        return "ERROR: INVALID_TOTAL_BYTES"
-
-    if mode not in {"encrypt", "decrypt"}:
-        return "ERROR: INVALID_MODE"
-    if key_number not in {"1", "2", "3"}:
-        return "ERROR: INVALID_KEY"
-
-    log_backend_info(f"[BULK] 수신 시작 - user={user_id}, mode={mode}, key={key_number}, total={total_bytes}bytes")
-
-    # BULK_READY 응답
-    conn.sendall(b"BULK_READY\n")
-
-    # 청크 수신 루프
-    assembled = bytearray()
-    while True:
-        line = recv_until_newline(conn)
-        if not line:
-            return "ERROR: BULK_CONNECTION_LOST"
-
-        if line == "KEY_BULK_END":
-            break
-
-        # Base64 청크 디코딩
-        try:
-            chunk = base64.b64decode(line)
-        except Exception:
-            return "ERROR: INVALID_CHUNK_BASE64"
-
-        assembled.extend(chunk)
-        conn.sendall(b"CHUNK_OK\n")
-
-    log_backend_info(f"[BULK] 수신 완료 - 실제={len(assembled)}bytes")
-
-    payload_bytes = bytes(assembled)
-
-    # ── Step 1: Arduino LED ON ────────────────────────────────────────────
-    log_backend_info(f"[BULK STEP 1/3] Arduino LED ON - key={key_number}")
-    ok, detail = send_key_command_to_arduino(mode, key_number)
-    if not ok:
-        log_backend_error(f"Arduino 키 명령 실패 - detail={detail}")
-        return f"ERROR: {detail}"
-
-    # ── Step 2: 카메라 캡처 → Von Neumann 키 추출 ─────────────────────────
-    log_backend_info("[BULK STEP 2/3] 이미지 캡처 및 대칭키 추출...")
-    key_bytes = capture_and_extract_key()
-    if key_bytes is None:
-        return "ERROR: KEY_EXTRACTION_FAILED"
-
-    # ── Step 3: AES-192-CBC 암복호화 ──────────────────────────────────────
-    log_backend_info(f"[BULK STEP 3/3] AES-192-CBC {mode}...")
-    try:
-        if mode == "encrypt":
-            ciphertext, iv = aes_192_encrypt(key_bytes, payload_bytes)
-            log_backend_info("[BULK] 암호화 완료")
-            return f"KEY_ENCRYPT_OK:{ciphertext.hex()}:{iv.hex()}"
-        else:
-            # payload = "<ciphertext_hex>:<iv_hex>" (UTF-8 텍스트)
-            text = payload_bytes.decode("utf-8").strip()
-            sep  = text.rfind(":")
-            if sep < 0:
-                return "ERROR: INVALID_DECRYPT_DATA"
-            ciphertext = bytes.fromhex(text[:sep])
-            iv         = bytes.fromhex(text[sep + 1:])
-            plaintext  = aes_192_decrypt(key_bytes, ciphertext, iv)
-            log_backend_info("[BULK] 복호화 완료")
-            return f"KEY_DECRYPT_OK:{base64.b64encode(plaintext).decode('ascii')}"
-    except Exception as exc:
-        log_backend_error(f"암복호화 실패: {exc}")
-        return "ERROR: CRYPTO_FAILED"
-
-
 def recv_until_newline(conn: "ssl.SSLSocket") -> str:
     chunks: list[bytes] = []
     while True:
@@ -832,11 +752,7 @@ def main() -> None:
 
                             log_backend_info(f"[세션 명령] user={session_user}, command={cmd[:200]}")
 
-                            # 대용량 청크 전송 처리 (이미지 암복호화)
-                            if cmd.startswith("KEY_BULK_BEGIN:"):
-                                resp = handle_bulk_key_command(conn, cmd)
-                            else:
-                                resp = handle_command(cmd)
+                            resp = handle_command(cmd)
 
                             log_backend_info(f"[세션 응답] reply={resp[:120]}")
                             conn.sendall((resp + "\n").encode("utf-8"))

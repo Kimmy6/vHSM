@@ -424,12 +424,12 @@ void AppController::startEncryptWithKey(const QString &keyNumber)
         m_state.setStatusMessage(QStringLiteral("먼저 이미지를 선택해주세요.")); return;
     }
 
-    // 이미지 파일 읽기 (바이너리 그대로 청크 전송)
+    // 이미지 파일 읽기 → Base64 인코딩
     QFile f(filePath);
     if (!f.open(QIODevice::ReadOnly)) {
         m_state.setStatusMessage(QStringLiteral("이미지 파일을 열 수 없습니다.")); return;
     }
-    const QByteArray imageBytes = f.readAll();
+    const QString imageB64 = QString::fromLatin1(f.readAll().toBase64());
     f.close();
 
     m_state.setStatusMessage(QStringLiteral("vHSM 암호화 처리 중..."));
@@ -445,32 +445,29 @@ void AppController::startEncryptWithKey(const QString &keyNumber)
     QString outPath = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)
                       + QStringLiteral("/") + fi.fileName() + QStringLiteral(".enc");
 
-    QtConcurrent::run([this, user, host, keyNum, imageBytes, outPath]() {
-        QString result, err;
-        bool ok = m_piGatewayService.sendBulkKeyCommand(user,
-                      QStringLiteral("encrypt"), keyNum, imageBytes, &result, &err);
+    // 메인 스레드에서 직접 실행 (QSslSocket은 생성한 스레드에서만 사용 가능)
+    QString result, err;
+    bool ok = m_piGatewayService.sendKeyCommand(user, host,
+                  QStringLiteral("encrypt"), keyNum, imageB64, &result, &err);
 
-        QMetaObject::invokeMethod(this, [this, ok, result, err, outPath]() {
-            if (!ok) {
-                m_state.setStatusMessage(err.isEmpty() ? QStringLiteral("암호화 실패") : err);
-            } else {
-                // result = "<ciphertext_hex>:<iv_hex>" → .enc 파일로 저장
-                QFile out(outPath);
-                QFileInfo outDir(outPath);
-                QDir().mkpath(outDir.absolutePath());
-                if (out.open(QIODevice::WriteOnly | QIODevice::Text)) {
-                    out.write(result.toUtf8());
-                    out.close();
-                    m_state.setStatusMessage(QStringLiteral("데이터 암호화 완료!"));
-                    m_state.setResultFilePath(outPath);
-                    m_state.setCryptoResult(result.left(32) + QStringLiteral("..."));
-                } else {
-                    m_state.setStatusMessage(QStringLiteral("암호화 성공, 파일 저장 실패: ") + outPath);
-                }
-            }
-            emit operationFinished();
-        }, Qt::QueuedConnection);
-    });
+    if (!ok) {
+        m_state.setStatusMessage(err.isEmpty() ? QStringLiteral("암호화 실패") : err);
+    } else {
+        // result = "<ciphertext_hex>:<iv_hex>" → .enc 파일로 저장
+        QFile out(outPath);
+        QFileInfo outDir(outPath);
+        QDir().mkpath(outDir.absolutePath());
+        if (out.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            out.write(result.toUtf8());
+            out.close();
+            m_state.setStatusMessage(QStringLiteral("데이터 암호화 완료!"));
+            m_state.setResultFilePath(outPath);
+            m_state.setCryptoResult(result.left(32) + QStringLiteral("..."));
+        } else {
+            m_state.setStatusMessage(QStringLiteral("암호화 성공, 파일 저장 실패: ") + outPath);
+        }
+    }
+    emit operationFinished();
 }
 
 void AppController::startDecryptWithKey(const QString &keyNumber)
@@ -512,36 +509,30 @@ void AppController::startDecryptWithKey(const QString &keyNumber)
                          ? baseName.left(dotPos) + QStringLiteral("_decrypted") + baseName.mid(dotPos)
                          : baseName + QStringLiteral("_decrypted"));
 
-    // .enc 파일 내용을 바이너리로 전송 (청크 전송)
-    const QByteArray encPayload = data.toUtf8();
+    // 메인 스레드에서 직접 실행 (QSslSocket은 생성한 스레드에서만 사용 가능)
+    QString result, err;
+    bool ok = m_piGatewayService.sendKeyCommand(user, host,
+                  QStringLiteral("decrypt"), keyNum, data, &result, &err);
 
-    QtConcurrent::run([this, user, host, keyNum, encPayload, outPath]() {
-        QString result, err;
-        bool ok = m_piGatewayService.sendBulkKeyCommand(user,
-                      QStringLiteral("decrypt"), keyNum, encPayload, &result, &err);
-
-        QMetaObject::invokeMethod(this, [this, ok, result, err, outPath]() {
-            if (!ok) {
-                m_state.setStatusMessage(err.isEmpty() ? QStringLiteral("복호화 실패") : err);
-            } else {
-                // result = plaintext Base64 (원본 이미지 바이트) → 파일 저장
-                const QByteArray imageBytes = QByteArray::fromBase64(result.toLatin1());
-                QFile out(outPath);
-                QFileInfo outDir(outPath);
-                QDir().mkpath(outDir.absolutePath());
-                if (out.open(QIODevice::WriteOnly)) {
-                    out.write(imageBytes);
-                    out.close();
-                    m_state.setStatusMessage(QStringLiteral("데이터 복호화 완료!"));
-                    m_state.setResultFilePath(outPath);
-                    m_state.setCryptoResult(QStringLiteral("복호화된 이미지가 저장되었습니다."));
-                } else {
-                    m_state.setStatusMessage(QStringLiteral("복호화 성공, 파일 저장 실패: ") + outPath);
-                }
-            }
-            emit operationFinished();
-        }, Qt::QueuedConnection);
-    });
+    if (!ok) {
+        m_state.setStatusMessage(err.isEmpty() ? QStringLiteral("복호화 실패") : err);
+    } else {
+        // result = plaintext Base64 (원본 이미지 바이트) → 파일 저장
+        const QByteArray imageBytes = QByteArray::fromBase64(result.toLatin1());
+        QFile out(outPath);
+        QFileInfo outDir(outPath);
+        QDir().mkpath(outDir.absolutePath());
+        if (out.open(QIODevice::WriteOnly)) {
+            out.write(imageBytes);
+            out.close();
+            m_state.setStatusMessage(QStringLiteral("데이터 복호화 완료!"));
+            m_state.setResultFilePath(outPath);
+            m_state.setCryptoResult(QStringLiteral("복호화된 이미지가 저장되었습니다."));
+        } else {
+            m_state.setStatusMessage(QStringLiteral("복호화 성공, 파일 저장 실패: ") + outPath);
+        }
+    }
+    emit operationFinished();
 }
 
 
