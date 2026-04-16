@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest
+## Run: idf.py add-dependency "espressif/esp32-camera"
+## or let this file auto-resolve on first build.
+
+dependencies:
+  espressif/esp32-camera:
+    version: ">=2.0.0"
+  idf:
+    version: ">=5.0.0"
