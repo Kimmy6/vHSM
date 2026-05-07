@@ -1,0 +1,5 @@
+g++ main.c crypto.c encryption.c decryption.c module_mod.cpp \
+    -o vhsm_crypto \
+    $(pkg-config --cflags --libs opencv4) \
+    -lssl -lcrypto \
+    -O2 -std=c++17

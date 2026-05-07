@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "crypto.c"
+        "aes_crypto.c"
+        "image_capture.c"
+        "sdcard_storage.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        mbedtls
+        driver
+        log
+        esp_hw_support
+        espressif__esp32-camera
+        fatfs
+)
