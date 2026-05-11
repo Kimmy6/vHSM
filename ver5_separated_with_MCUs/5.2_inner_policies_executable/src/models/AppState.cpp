@@ -59,12 +59,10 @@ void AppState::setPendingResetUserId(const QString &v)        { if (m_pendingRes
 
 QString AppState::currentRole() const { return m_currentRole; }
 void AppState::setCurrentRole(const QString &v)            { if (m_currentRole==v) return; m_currentRole=v; emit currentRoleChanged(); }
+QString AppState::auditLogJson() const { return m_auditLogJson; }
+void AppState::setAuditLogJson(const QString &v)           { if (m_auditLogJson==v) return; m_auditLogJson=v; emit auditLogJsonChanged(); }
 
-QString AppState::inviteCode() const { return m_inviteCode; }
-void AppState::setInviteCode(const QString &v)             { if (m_inviteCode==v) return; m_inviteCode=v; emit inviteCodeChanged(); }
 
-QString AppState::slotListJson() const { return m_slotListJson; }
-void AppState::setSlotListJson(const QString &v)           { if (m_slotListJson==v) return; m_slotListJson=v; emit slotListJsonChanged(); }
 
 QString AppState::tlsSessionStatus() const { return m_tlsSessionStatus; }
 void AppState::setTlsSessionStatus(const QString &v)          { if (m_tlsSessionStatus==v) return; m_tlsSessionStatus=v; emit tlsSessionStatusChanged(); }

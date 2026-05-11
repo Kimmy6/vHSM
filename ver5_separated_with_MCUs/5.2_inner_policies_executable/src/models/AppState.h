@@ -23,8 +23,7 @@ class AppState : public QObject
     Q_PROPERTY(QString pendingResetUserId        READ pendingResetUserId        WRITE setPendingResetUserId        NOTIFY pendingResetUserIdChanged)
     // TLS 세션 열기 결과 메시지 (ConnectPage에 표시)
     Q_PROPERTY(QString currentRole              READ currentRole              WRITE setCurrentRole              NOTIFY currentRoleChanged)
-    Q_PROPERTY(QString inviteCode               READ inviteCode               WRITE setInviteCode               NOTIFY inviteCodeChanged)
-    Q_PROPERTY(QString slotListJson             READ slotListJson             WRITE setSlotListJson             NOTIFY slotListJsonChanged)
+    Q_PROPERTY(QString auditLogJson             READ auditLogJson             WRITE setAuditLogJson             NOTIFY auditLogJsonChanged)
     Q_PROPERTY(QString tlsSessionStatus          READ tlsSessionStatus          WRITE setTlsSessionStatus          NOTIFY tlsSessionStatusChanged)
     Q_PROPERTY(QString tlsSignaturePreview       READ tlsSignaturePreview       WRITE setTlsSignaturePreview       NOTIFY tlsSignaturePreviewChanged)
     // 암복호화 결과 (ActionPage에 표시)
@@ -50,8 +49,7 @@ public:
     QString resetPasswordStatusMessage()const;  void setResetPasswordStatusMessage(const QString &v);
     QString pendingResetUserId()        const;  void setPendingResetUserId(const QString &v);
     QString currentRole()               const;  void setCurrentRole(const QString &v);
-    QString inviteCode()                const;  void setInviteCode(const QString &v);
-    QString slotListJson()              const;  void setSlotListJson(const QString &v);
+    QString auditLogJson()              const;  void setAuditLogJson(const QString &v);
     QString tlsSessionStatus()          const;  void setTlsSessionStatus(const QString &v);
     QString tlsSignaturePreview()        const;  void setTlsSignaturePreview(const QString &v);
     QString cryptoResult()               const;  void setCryptoResult(const QString &v);
@@ -73,8 +71,7 @@ signals:
     void resetPasswordStatusMessageChanged();
     void pendingResetUserIdChanged();
     void currentRoleChanged();
-    void inviteCodeChanged();
-    void slotListJsonChanged();
+    void auditLogJsonChanged();
     void tlsSessionStatusChanged();
     void tlsSignaturePreviewChanged();
     void cryptoResultChanged();
@@ -96,8 +93,7 @@ private:
     QString m_resetPasswordStatusMessage;
     QString m_pendingResetUserId;
     QString m_currentRole;
-    QString m_inviteCode;
-    QString m_slotListJson;
+    QString m_auditLogJson;
     QString m_tlsSessionStatus;
     QString m_tlsSignaturePreview;
     QString m_cryptoResult;

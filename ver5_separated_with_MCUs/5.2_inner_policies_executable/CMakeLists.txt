@@ -16,7 +16,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Concurren
 qt_add_executable(VirtualHSM
     MANUAL_FINALIZATION
     main.cpp
-    resources.qrc
+
     src/controllers/AppController.cpp
     src/models/AppState.cpp
     src/services/AuthService.cpp
@@ -24,6 +24,7 @@ qt_add_executable(VirtualHSM
     src/services/PiGatewayService.cpp
     src/services/MldsaService.cpp
     src/utils/FileUtils.cpp
+    resources.qrc
 )
 
 target_include_directories(VirtualHSM PRIVATE

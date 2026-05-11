@@ -28,36 +28,6 @@ public:
                    QString *errorMessage,
                    QString *outRole = nullptr);
 
-    bool bootstrapRootOfficer(const QString &userId,
-                              const QString &password,
-                              const QString &name,
-                              const QString &email,
-                              const QString &piHostOrName,
-                              QString *errorMessage) const;
-
-    bool createSlot(const QString &rootId,
-                    const QString &slotName,
-                    const QString &piHostOrName,
-                    QString *errorMessage);
-
-    bool createUserInSlot(const QString &rootId,
-                          const QString &slotId,
-                          const QString &newUserId,
-                          const QString &password,
-                          const QString &name,
-                          const QString &email,
-                          const QString &role,
-                          const QString &piHostOrName,
-                          QString *errorMessage);
-
-    bool generateInvite(const QString &rootId,
-                        const QString &slotId,
-                        const QString &role,
-                        int expireDays,
-                        const QString &piHostOrName,
-                        QString *outCode,
-                        QString *errorMessage);
-
     bool registerWithInvite(const QString &inviteCode,
                             const QString &newUserId,
                             const QString &password,
@@ -66,10 +36,10 @@ public:
                             const QString &piHostOrName,
                             QString *errorMessage) const;
 
-    bool listSlots(const QString &rootId,
-                   const QString &piHostOrName,
-                   QString *outSlotJson,
-                   QString *errorMessage);
+    bool getAuditLog(const QString &userId,
+                     const QString &piHostOrName,
+                     QString *outJson,
+                     QString *errorMessage);
 
     bool findUserId(const QString &name,
                     const QString &piHostOrName,

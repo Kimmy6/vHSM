@@ -46,6 +46,7 @@ CA_CERT_PATH  = PROJECT_ROOT / "ca_cert.pem"
 CA_KEY_PATH   = PROJECT_ROOT / "ca_key.pem"
 
 USERS_DB_PATH = PROJECT_ROOT / "users.json"
+AUDIT_LOG_PATH = PROJECT_ROOT / "audit.log"
 
 SCRYPT_N        = 2 ** 14
 SCRYPT_R        = 8
@@ -61,6 +62,21 @@ def log_backend_info(message: str) -> None:
 
 def log_backend_error(message: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [BACKEND ERROR] {message}", flush=True)
+
+def log_audit(event: str, user_id: str = "", role: str = "", detail: str = "", client_ip: str = "") -> None:
+    entry = json.dumps({
+        "timestamp": datetime.utcnow().isoformat(),
+        "event":     event,
+        "user":      user_id,
+        "role":      role,
+        "detail":    detail,
+        "client_ip": client_ip,
+    }, ensure_ascii=False)
+    try:
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception as exc:
+        log_backend_error(f"감사 로그 기록 실패: {exc}")
 
 
 # ─── TLS ────────────────────────────────────────────────────────────────────
@@ -202,8 +218,8 @@ VALID_ROLES: Final[set] = {
 ROLE_PERMISSIONS: Final[dict] = {
     "public_user":                {"KEY_COMMAND", "LOGIN", "START_AUTH"},
     "audit_user":                 {"LOGIN", "START_AUTH", "GET_AUDIT_LOG"},
-    "partition_security_officer": {"LOGIN", "START_AUTH", "GET_AUDIT_LOG", "PARTITION_POLICY"},
-    "puf_maintenance_officer":    {"LOGIN", "START_AUTH", "GET_AUDIT_LOG", "ZEROIZE_PUF"},
+    "partition_security_officer": {"LOGIN", "START_AUTH", "PARTITION_POLICY"},
+    "puf_maintenance_officer":    {"LOGIN", "START_AUTH", "ZEROIZE_PUF"},
     "hsm_root_officer":           {"LOGIN", "START_AUTH", "GET_AUDIT_LOG", "KEY_COMMAND",
                                    "PARTITION_POLICY", "ZEROIZE_PUF", "ZEROIZE_ALL",
                                    "CREATE_SLOT", "CREATE_USER", "LIST_SLOTS"},
@@ -309,19 +325,25 @@ def bootstrap_root_officer(user_id: str, password: str, name: str, email: str) -
 
 # ─── 슬롯 생성 (Root Officer 전용) ───────────────────────────────────────────
 
-def create_slot(root_id: str, slot_name: str) -> str:
+def create_slot(root_id: str, slot_name: str, allowed_roles: list | None = None) -> str:
     if get_user_role(root_id) != "hsm_root_officer":
         return "ERROR: PERMISSION_DENIED"
     import uuid
     data = load_users()
     slot_id = "slot_" + uuid.uuid4().hex[:8]
+    permitted = [r for r in (allowed_roles or []) if r in VALID_ROLES and r != "hsm_root_officer"]
+    if not permitted:
+        permitted = ["public_user", "audit_user", "partition_security_officer", "puf_maintenance_officer"]
     data["slots"][slot_id] = {
-        "name": slot_name.strip(),
-        "created_by": sanitize_user_id(root_id),
-        "users": {},
+        "name":          slot_name.strip(),
+        "created_by":    sanitize_user_id(root_id),
+        "allowed_roles": permitted,
+        "users":         {},
     }
     save_users(data)
-    log_backend_info(f"슬롯 생성: {slot_id} ('{slot_name}') by {root_id}")
+    log_backend_info(f"슬롯 생성: {slot_id} ('{slot_name}') by {root_id}, allowed={permitted}")
+    log_audit("CREATE_SLOT", user_id=root_id, role="hsm_root_officer",
+              detail=f"slot_id={slot_id}, name={slot_name}, allowed_roles={permitted}")
     return f"CREATE_SLOT_OK:{slot_id}"
 
 # ─── 슬롯 내 유저 생성 (Root Officer 전용) ────────────────────────────────────
@@ -374,7 +396,9 @@ def generate_invite(root_id: str, slot_id: str, role: str, expire_days: int) -> 
     data = load_users()
     if slot_id not in data["slots"]:
         return "ERROR: SLOT_NOT_FOUND"
-    # 6자리 대문자+숫자 코드 생성 (중복 방지)
+    allowed = data["slots"][slot_id].get("allowed_roles", [])
+    if allowed and role not in allowed:
+        return "ERROR: ROLE_NOT_ALLOWED_IN_SLOT"
     import random, string
     while True:
         code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -391,6 +415,8 @@ def generate_invite(root_id: str, slot_id: str, role: str, expire_days: int) -> 
     }
     save_users(data)
     log_backend_info(f"초대 코드 생성: {code} (slot={slot_id}, role={role}, expires={expires_at})")
+    log_audit("GENERATE_INVITE", user_id=root_id, role="hsm_root_officer",
+              detail=f"code={code}, slot={slot_id}, role={role}")
     return f"INVITE_OK:{code}"
 
 # ─── 초대 코드로 회원가입 ────────────────────────────────────────────────────
@@ -430,6 +456,7 @@ def register_with_invite(code: str, new_id: str,
     invite["used"] = True  # 코드 소멸 (1회용)
     save_users(data)
     log_backend_info(f"초대 코드 가입 완료: {safe_new} ({role}) in {slot_id}")
+    log_audit("REGISTER", user_id=safe_new, role=role, detail=f"slot={slot_id}, code={code}")
     return "REGISTER_WITH_INVITE_OK"
 
 # ─── 로그인 ──────────────────────────────────────────────────────────────────
@@ -443,8 +470,16 @@ def login_user(user_id: str, password: str) -> str:
     is_valid = verify_password(password, stored_hash)
     if not record or not is_valid:
         log_backend_error(f"로그인 실패 — 잘못된 인증 정보: user_id={safe_id}")
+        log_audit("LOGIN_FAIL", user_id=safe_id, detail="INVALID_CREDENTIALS")
         return "ERROR: INVALID_CREDENTIALS"
+    # 앱 접근 불가 역할 — Pi CLI(hsm_cli.py) 전용
+    _BACKEND_CLI_ONLY = {"hsm_root_officer", "puf_maintenance_officer", "partition_security_officer"}
+    if role in _BACKEND_CLI_ONLY:
+        log_backend_error(f"로그인 거부 — CLI 전용 역할: user_id={safe_id}, role={role}")
+        log_audit("LOGIN_DENY", user_id=safe_id, role=role, detail="BACKEND_CLI_ONLY")
+        return "ERROR: BACKEND_CLI_ONLY"
     log_backend_info(f"로그인 성공 - user_id={safe_id}, role={role}")
+    log_audit("LOGIN_OK", user_id=safe_id, role=role)
     return f"LOGIN_OK:{role}"
 
 
@@ -712,6 +747,7 @@ def handle_key_command(user_id: str, mode: str, key_number: str, data: str) -> s
             plaintext            = base64.b64decode(data)
             ciphertext, iv       = aes_192_encrypt(key_bytes, plaintext)
             log_backend_info("[STEP 2/2] 암호화 완료")
+            log_audit("KEY_ENCRYPT", user_id=user_id, detail=f"key={normalized_key}")
             return f"KEY_ENCRYPT_OK:{ciphertext.hex()}:{iv.hex()}"
         else:
             sep = data.rfind(":")
@@ -721,6 +757,7 @@ def handle_key_command(user_id: str, mode: str, key_number: str, data: str) -> s
             iv         = bytes.fromhex(data[sep + 1:])
             plaintext  = aes_192_decrypt(key_bytes, ciphertext, iv)
             log_backend_info("[STEP 2/2] 복호화 완료")
+            log_audit("KEY_DECRYPT", user_id=user_id, detail=f"key={normalized_key}")
             return f"KEY_DECRYPT_OK:{base64.b64encode(plaintext).decode('ascii')}"
     except Exception as exc:
         log_backend_error(f"암복호화 실패: {exc}")
@@ -874,6 +911,47 @@ def handle_command(command: str) -> str:
             log_backend_error(f"RESET_PASSWORD 디코딩 실패: {exc}")
             return "ERROR: RESET_FAILED"
         return reset_password(parts[1].strip(), new_password)
+
+    if command.startswith("GET_AUDIT_LOG:"):
+        user_id = command.split(":", 1)[1].strip()
+        role = get_user_role(user_id)
+        if "GET_AUDIT_LOG" not in ROLE_PERMISSIONS.get(role, set()):
+            log_audit("AUDIT_LOG_DENIED", user_id=user_id, role=role)
+            return "ERROR: PERMISSION_DENIED"
+        try:
+            if AUDIT_LOG_PATH.exists():
+                lines = AUDIT_LOG_PATH.read_text(encoding="utf-8").splitlines()
+                recent = lines[-200:]  # 최근 200개
+            else:
+                recent = []
+            payload = base64.b64encode(
+                json.dumps(recent, ensure_ascii=False).encode()
+            ).decode()
+            log_audit("GET_AUDIT_LOG", user_id=user_id, role=role)
+            return f"AUDIT_LOG_OK:{payload}"
+        except Exception as exc:
+            log_backend_error(f"GET_AUDIT_LOG 실패: {exc}")
+            return "ERROR: AUDIT_LOG_FAILED"
+
+    if command.startswith("ZEROIZE_PUF:"):
+        user_id = command.split(":", 1)[1].strip()
+        role = get_user_role(user_id)
+        if "ZEROIZE_PUF" not in ROLE_PERMISSIONS.get(role, set()):
+            log_audit("ZEROIZE_DENIED", user_id=user_id, role=role)
+            return "ERROR: PERMISSION_DENIED"
+        # OKM(파생 키) zeroization: 해당 유저의 키 파일 삭제
+        safe = sanitize_user_id(user_id)
+        user_key_dir = KEY_STORE_DIR / safe
+        try:
+            if user_key_dir.exists():
+                import shutil
+                shutil.rmtree(user_key_dir)
+            log_backend_info(f"PUF OKM 초기화 완료 - user={user_id}")
+            log_audit("ZEROIZE_PUF", user_id=user_id, role=role, detail="OKM zeroized")
+            return "ZEROIZE_PUF_OK"
+        except Exception as exc:
+            log_backend_error(f"ZEROIZE_PUF 실패: {exc}")
+            return "ERROR: ZEROIZE_FAILED"
 
     if command.startswith("SESSION_CLOSE:"):
         return "SESSION_CLOSED"

@@ -18,9 +18,8 @@
         <file>qml/pages/ResetPasswordPage.qml</file>
         <file>qml/styles/Theme.qml</file>
         <file>qml/styles/qmldir</file>
+        <file>qml/pages/AuditPage.qml</file>
         <file>assets/fonts/NotoSansKR-Regular.ttf</file>
         <file>assets/certs/ca_cert.pem</file>
-        <file>qml/pages/AdminPage.qml</file>
-        <file>qml/pages/BootstrapPage.qml</file>
     </qresource>
 </RCC>

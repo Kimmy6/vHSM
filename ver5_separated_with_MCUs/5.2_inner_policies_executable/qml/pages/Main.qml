@@ -67,14 +67,6 @@ ApplicationWindow {
             stackView.push(Qt.resolvedUrl("pages/SignUpPage.qml"), { "stackViewRef": stackView })
         }
 
-        function onOpenBootstrapPage() {
-            stackView.push(Qt.resolvedUrl("pages/BootstrapPage.qml"), { "stackViewRef": stackView })
-        }
-
-        function onOpenAdminPage() {
-            stackView.push(Qt.resolvedUrl("pages/AdminPage.qml"), { "stackViewRef": stackView })
-        }
-
         function onOpenFindIdPage() {
             stackView.push(Qt.resolvedUrl("pages/FindIdPage.qml"), { "stackViewRef": stackView })
         }

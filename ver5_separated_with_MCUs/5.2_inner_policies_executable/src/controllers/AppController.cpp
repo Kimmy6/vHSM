@@ -40,7 +40,7 @@ AppController::AppController(QObject *parent) : QObject(parent)
     connect(&m_state, &AppState::cryptoResultChanged,              this, &AppController::cryptoResultChanged);
     connect(&m_state, &AppState::resultFilePathChanged,            this, &AppController::resultFilePathChanged);
     connect(&m_state, &AppState::currentRoleChanged,            this, &AppController::currentRoleChanged);
-    connect(&m_state, &AppState::inviteCodeChanged,             this, &AppController::inviteCodeChanged);
+    connect(&m_state, &AppState::auditLogJsonChanged,           this, &AppController::auditLogJsonChanged);
 }
 
 // ── 프로퍼티 읽기 ───────────────────────────────────────────────────────────
@@ -65,8 +65,7 @@ QString AppController::findIdStatusMessage()       const { return m_state.findId
 QString AppController::findPasswordStatusMessage() const { return m_state.findPasswordStatusMessage(); }
 QString AppController::resetPasswordStatusMessage()const { return m_state.resetPasswordStatusMessage(); }
 QString AppController::currentRole()               const { return m_state.currentRole(); }
-QString AppController::inviteCode()                const { return m_state.inviteCode(); }
-QString AppController::slotListJson()              const { return m_state.slotListJson(); }
+QString AppController::auditLogJson()              const { return m_state.auditLogJson(); }
 QString AppController::tlsSessionStatus()          const { return m_state.tlsSessionStatus(); }
 QString AppController::tlsSignaturePreview()        const { return m_state.tlsSignaturePreview(); }
 QString AppController::cryptoResult()               const { return m_state.cryptoResult(); }
@@ -356,7 +355,10 @@ void AppController::finishConnect()
 {
     m_state.setStatusMessage(QString());
     m_state.setConnectionPhase(QStringLiteral("인증 완료"));
-    emit connectSuccess();
+    if (m_state.currentRole() == QStringLiteral("audit_user"))
+        emit openAuditPage();
+    else
+        emit connectSuccess();
 }
 
 
@@ -560,57 +562,6 @@ void AppController::goToFindPasswordPage() { m_state.setFindPasswordStatusMessag
 
 // ── 회원가입 ────────────────────────────────────────────────────────────────
 
-// ── Bootstrap: DB 비어있을 때만 최초 Root Officer 생성 ─────────────────────────
-void AppController::bootstrapRootOfficer(const QString &id, const QString &password,
-                                          const QString &passwordConfirm,
-                                          const QString &name, const QString &email)
-{
-    if (id.trimmed().isEmpty() || name.trimmed().isEmpty()) {
-        m_state.setSignUpStatusMessage(QStringLiteral("아이디와 이름은 필수 입력 항목입니다.")); return;
-    }
-    QString pwError;
-    if (!m_authService.validatePassword(password, &pwError)) { m_state.setSignUpStatusMessage(pwError); return; }
-    if (!m_authService.passwordsMatch(password, passwordConfirm, &pwError)) { m_state.setSignUpStatusMessage(pwError); return; }
-    const QString piHost = m_state.currentPiHost();
-    if (piHost.isEmpty()) { m_state.setSignUpStatusMessage(QStringLiteral("Pi IP가 설정되지 않았습니다.")); return; }
-
-    m_state.setSignUpStatusMessage(QStringLiteral("HSM 초기화 중..."));
-    QString err;
-    if (!m_piGatewayService.bootstrapRootOfficer(id.trimmed(), password,
-                                                   name.trimmed(), email.trimmed(), piHost, &err)) {
-        m_state.setSignUpStatusMessage(err.isEmpty() ? QStringLiteral("초기화 실패") : err); return;
-    }
-    m_state.setSignUpStatusMessage(QStringLiteral("HSM Root Officer 계정이 생성되었습니다.\n로그인 후 슬롯과 유저를 생성하세요."));
-}
-
-// ── 초대 코드 생성 ────────────────────────────────────────────────────────────
-static QString inviteRoleFromIndex(int index)
-{
-    switch (index) {
-    case 0:  return QStringLiteral("audit_user");
-    case 1:  return QStringLiteral("partition_security_officer");
-    case 2:  return QStringLiteral("puf_maintenance_officer");
-    default: return QStringLiteral("public_user");
-    }
-}
-
-void AppController::generateInvite(const QString &slotId, int roleIndex, int expireDays)
-{
-    if (slotId.trimmed().isEmpty()) {
-        m_state.setSignUpStatusMessage(QStringLiteral("슬롯을 선택해주세요.")); return;
-    }
-    const QString role = inviteRoleFromIndex(roleIndex);
-    const QString piHost = m_state.currentPiHost();
-    QString code, err;
-    if (!m_piGatewayService.generateInvite(m_state.currentUser(), slotId.trimmed(),
-                                            role, expireDays, piHost, &code, &err)) {
-        m_state.setSignUpStatusMessage(err.isEmpty() ? QStringLiteral("초대 코드 생성 실패") : err);
-        return;
-    }
-    m_state.setInviteCode(code);
-    m_state.setSignUpStatusMessage(QStringLiteral("초대 코드: ") + code);
-}
-
 // ── 초대 코드로 회원가입 ──────────────────────────────────────────────────────
 void AppController::signUpWithInvite(const QString &id, const QString &password,
                                       const QString &passwordConfirm,
@@ -640,65 +591,22 @@ void AppController::signUpWithInvite(const QString &id, const QString &password,
     m_state.setSignUpStatusMessage(QStringLiteral("가입 완료!\n로그인 후 'TLS 세션 열기'를 눌러 키를 등록해주세요."));
 }
 
-// ── 슬롯 생성 ────────────────────────────────────────────────────────────────
-void AppController::createSlot(const QString &slotName)
-{
-    if (slotName.trimmed().isEmpty()) {
-        m_state.setSignUpStatusMessage(QStringLiteral("슬롯 이름을 입력해주세요.")); return;
-    }
-    const QString piHost = m_state.currentPiHost();
-    QString err;
-    if (!m_piGatewayService.createSlot(m_state.currentUser(), slotName.trimmed(), piHost, &err)) {
-        m_state.setSignUpStatusMessage(err.isEmpty() ? QStringLiteral("슬롯 생성 실패") : err); return;
-    }
-    m_state.setSignUpStatusMessage(QStringLiteral("슬롯이 생성되었습니다."));
-    requestSlotList();
-}
-
-// ── 슬롯 내 유저 생성 ────────────────────────────────────────────────────────
-static QString roleFromIndex(int index)
-{
-    switch (index) {
-    case 0:  return QStringLiteral("audit_user");
-    case 1:  return QStringLiteral("partition_security_officer");
-    case 2:  return QStringLiteral("puf_maintenance_officer");
-    default: return QStringLiteral("public_user");
-    }
-}
-
-void AppController::createUserInSlot(const QString &slotId, const QString &newId,
-                                      const QString &password, const QString &passwordConfirm,
-                                      const QString &name, const QString &email, int roleIndex)
-{
-    if (newId.trimmed().isEmpty() || name.trimmed().isEmpty()) {
-        m_state.setSignUpStatusMessage(QStringLiteral("아이디와 이름은 필수입니다.")); return;
-    }
-    QString pwError;
-    if (!m_authService.validatePassword(password, &pwError)) { m_state.setSignUpStatusMessage(pwError); return; }
-    if (!m_authService.passwordsMatch(password, passwordConfirm, &pwError)) { m_state.setSignUpStatusMessage(pwError); return; }
-    const QString piHost = m_state.currentPiHost();
-    const QString role   = roleFromIndex(roleIndex);
-    QString err;
-    if (!m_piGatewayService.createUserInSlot(m_state.currentUser(), slotId, newId.trimmed(),
-                                              password, name.trimmed(), email.trimmed(), role, piHost, &err)) {
-        m_state.setSignUpStatusMessage(err.isEmpty() ? QStringLiteral("유저 생성 실패") : err); return;
-    }
-    m_state.setSignUpStatusMessage(QStringLiteral("유저가 생성되었습니다."));
-}
-
-// ── 슬롯 목록 요청 ────────────────────────────────────────────────────────────
-void AppController::requestSlotList()
-{
-    const QString piHost = m_state.currentPiHost();
-    QString err, slotJson;
-    if (m_piGatewayService.listSlots(m_state.currentUser(), piHost, &slotJson, &err))
-        m_state.setSlotListJson(slotJson);
-    else
-        m_state.setSignUpStatusMessage(err.isEmpty() ? QStringLiteral("슬롯 목록 조회 실패") : err);
-}
-
 
 // ── 아이디 찾기 ─────────────────────────────────────────────────────────────
+
+void AppController::requestAuditLog()
+{
+    const QString piHost = m_state.currentPiHost();
+    if (piHost.isEmpty()) {
+        m_state.setAuditLogJson(QStringLiteral("[]"));
+        return;
+    }
+    QString logJson, err;
+    if (m_piGatewayService.getAuditLog(m_state.currentUser(), piHost, &logJson, &err))
+        m_state.setAuditLogJson(logJson);
+    else
+        m_state.setAuditLogJson(QStringLiteral("[]"));
+}
 
 void AppController::findId(const QString &name)
 {

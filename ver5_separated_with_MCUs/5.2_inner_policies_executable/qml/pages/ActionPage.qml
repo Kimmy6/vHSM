@@ -193,46 +193,6 @@ Page {
                     }
                 }
 
-                Item { height: 30 }
-
-                // ── Root Officer 전용 관리 버튼 ───────────────────────
-                Rectangle {
-                    visible: appController.currentRole === "hsm_root_officer"
-                    width: 300
-                    height: 56
-                    radius: 10
-                    color: "#fdf0f0"
-                    border.color: "#c0392b"
-                    border.width: 1
-                    anchors.horizontalCenter: parent.horizontalCenter
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: 10
-
-                        Text {
-                            text: "🔐"
-                            font.pixelSize: 18
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: "HSM 관리 (슬롯 · 유저)"
-                            font.family: Theme.fontFamily
-                            font.pixelSize: 14
-                            font.bold: true
-                            color: "#c0392b"
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: stackViewRef.push(Qt.resolvedUrl("AdminPage.qml"),
-                                                     { "stackViewRef": stackViewRef })
-                    }
-                }
-
                 Item { height: 20 }
             }
         }

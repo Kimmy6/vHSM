@@ -34,8 +34,7 @@ class AppController : public QObject
 
     // ── TLS 세션 상태 메시지 (ConnectPage 표시용) ──────────────────────────
     Q_PROPERTY(QString currentRole              READ currentRole              NOTIFY currentRoleChanged)
-    Q_PROPERTY(QString inviteCode               READ inviteCode               NOTIFY inviteCodeChanged)
-    Q_PROPERTY(QString slotListJson             READ slotListJson             NOTIFY slotListJsonChanged)
+    Q_PROPERTY(QString auditLogJson             READ auditLogJson             NOTIFY auditLogJsonChanged)
     Q_PROPERTY(QString tlsSessionStatus          READ tlsSessionStatus          NOTIFY tlsSessionStatusChanged)
     Q_PROPERTY(QString tlsSignaturePreview       READ tlsSignaturePreview       NOTIFY tlsSignaturePreviewChanged)
     // 암복호화 결과 (ActionPage 표시용)
@@ -62,8 +61,7 @@ public:
     QString findPasswordStatusMessage()  const;
     QString resetPasswordStatusMessage() const;
     QString currentRole()                const;
-    QString inviteCode()                 const;
-    QString slotListJson()               const;
+    QString auditLogJson()               const;
     QString tlsSessionStatus()           const;
     QString tlsSignaturePreview()        const;
     QString cryptoResult()               const;
@@ -90,27 +88,13 @@ public:
     Q_INVOKABLE void goToSignUpPage(const QString &piHostOrName = QString());
     Q_INVOKABLE void goToFindIdPage(const QString &piHostOrName = QString());
     Q_INVOKABLE void goToFindPasswordPage();
-    // HSM 최초 초기화 (DB 비어있을 때만)
-    Q_INVOKABLE void bootstrapRootOfficer(const QString &id, const QString &password,
-                                          const QString &passwordConfirm,
-                                          const QString &name, const QString &email);
-    // Root Officer 전용: 초대 코드 생성
-    Q_INVOKABLE void generateInvite(const QString &slotId, int roleIndex, int expireDays);
     // 초대 코드로 회원가입
     Q_INVOKABLE void signUpWithInvite(const QString &id, const QString &password,
                                       const QString &passwordConfirm,
                                       const QString &name, const QString &email,
                                       const QString &inviteCode);
-    // Root Officer 전용: 슬롯 생성
-    Q_INVOKABLE void createSlot(const QString &slotName);
-    // Root Officer 전용: 슬롯 내 유저 생성
-    Q_INVOKABLE void createUserInSlot(const QString &slotId, const QString &newId,
-                                      const QString &password, const QString &passwordConfirm,
-                                      const QString &name, const QString &email,
-                                      int roleIndex);
-    // 슬롯 목록 요청
-    Q_INVOKABLE void requestSlotList();
     Q_INVOKABLE void findId(const QString &name);
+    Q_INVOKABLE void requestAuditLog();
     Q_INVOKABLE void findPassword(const QString &name, const QString &id);
     Q_INVOKABLE void resetPassword(const QString &password, const QString &passwordConfirm);
 
@@ -132,6 +116,7 @@ signals:
     void latestPublicKeyChanged();
 
     void connectSuccess();
+    void openAuditPage();
     void openConnectLoadingPage();
     void openRegeneratePage();
     void backToConnectPage();
@@ -144,7 +129,6 @@ signals:
     void findPasswordStatusMessageChanged();
     void resetPasswordStatusMessageChanged();
 
-    void openBootstrapPage();
     void openSignUpPage();
     void openFindIdPage();
     void openFindPasswordPage();
@@ -152,8 +136,7 @@ signals:
 
     // TLS 세션 관련 신규 시그널
     void currentRoleChanged();
-    void inviteCodeChanged();
-    void slotListJsonChanged();
+    void auditLogJsonChanged();
     void tlsSessionStatusChanged();
     void tlsSignaturePreviewChanged();
     // 성공 시 → Main.qml이 stackView.pop()으로 ConnectPage로 복귀
