@@ -1,6 +1,6 @@
 // image_capture.c
 // 디버깅 저장 플로우:
-//   1. JPEG(RGB) UXGA 캡처        → RGBoriginal.jpg
+//   1. JPEG(RGB) UXGA 캡처        → RGBoriginal.jpg  (KEY_HEX 전송 후 저장)
 //   2. GRAYSCALE SVGA 캡처        → original.jpg
 //   3. 320x240 리사이즈            → resized.jpg
 //   4. 임계값 처리                 → threshold.jpg
@@ -42,6 +42,10 @@ static const char *TAG = "IMG_CAP";
 #define CAM_PIN_HREF     23
 #define CAM_PIN_PCLK     22
 
+// 디버그 저장 활성화: SD 카드에 중간 이미지 + 비트 파일 저장
+// 운용 시 주석 처리 → RGB JPEG 캡처 단계 전체 생략, SD 쓰기 없음
+#define PUF_DEBUG_SAVE
+
 #define JPG_QUALITY      99
 
 #define RESIZE_WIDTH     320
@@ -68,9 +72,21 @@ static const char *TAG = "IMG_CAP";
     .fb_location  = CAMERA_FB_IN_PSRAM,         \
     .grab_mode    = CAMERA_GRAB_WHEN_EMPTY
 
+// ── 카메라 파워사이클 ────────────────────────────────────────────────────────
+// esp_camera_deinit() 후 재초기화 시 LEDC/I2C 상태 누적 문제 방지
+static void camera_power_cycle(void)
+{
+    gpio_set_direction((gpio_num_t)CAM_PIN_PWDN, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)CAM_PIN_PWDN, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level((gpio_num_t)CAM_PIN_PWDN, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
 // ── 1단계: RGB JPEG 캡처용 초기화 ───────────────────────────────────────────
 static esp_err_t camera_init_jpeg(void)
 {
+    camera_power_cycle();
     camera_config_t cfg = {
         CAM_PIN_CONFIG,
         .pixel_format = PIXFORMAT_JPEG,
@@ -86,12 +102,24 @@ static esp_err_t camera_init_jpeg(void)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_whitebal(s, 1);
-        s->set_awb_gain(s, 1);
-        s->set_wb_mode(s, 3);          // 3 = Office (실내 형광등)
-        s->set_gain_ctrl(s, 1);
-        s->set_exposure_ctrl(s, 1);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        s->set_whitebal(s,      0);  // AWB off
+        s->set_awb_gain(s,      0);  // AWB gain off
+        s->set_wb_mode(s,       0);  // WB mode (무관, AWB 꺼짐)
+        s->set_gain_ctrl(s,     0);  // AGC off
+        s->set_exposure_ctrl(s, 0);   // AEC sensor off
+        s->set_aec2(s,          0);   // AEC DSP off
+        s->set_ae_level(s,      0);   // AE 타겟 레벨 neutral
+        s->set_aec_value(s,   100);   // 수동 노출 시간 (0~1200)
+        s->set_bpc(s,           0);  // BPC off
+        s->set_wpc(s,           0);  // WPC off
+        s->set_raw_gma(s,       0);  // Raw GMA off
+        s->set_lenc(s,          0);  // Lens correction off
+        s->set_dcw(s,           0);  // DCW (디지털 다운사이즈) off
+        s->set_denoise(s,       0);  // 노이즈 제거 off (PUF 신호 보존)
+        s->set_sharpness(s,     0);  // 샤프닝 off
+        s->set_contrast(s,      0);  // 콘트라스트 neutral
+        s->set_brightness(s,    0);  // 밝기 neutral
+        s->set_special_effect(s,0);  // 특수효과 off
     }
     return ESP_OK;
 }
@@ -99,6 +127,7 @@ static esp_err_t camera_init_jpeg(void)
 // ── 2단계: 그레이스케일 캡처용 초기화 ───────────────────────────────────────
 static esp_err_t camera_init_gray(void)
 {
+    camera_power_cycle();
     camera_config_t cfg = {
         CAM_PIN_CONFIG,
         .pixel_format = PIXFORMAT_GRAYSCALE,
@@ -111,6 +140,21 @@ static esp_err_t camera_init_gray(void)
         return err;
     }
     ESP_LOGI(TAG, "Camera init: GRAYSCALE SVGA");
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_whitebal(s,     0);  // AWB off
+        s->set_awb_gain(s,     0);  // AWB gain off
+        s->set_wb_mode(s,      0);  // WB mode: auto (무관, AWB 꺼짐)
+        s->set_gain_ctrl(s,    0);  // AGC off
+        s->set_exposure_ctrl(s,0);  // AEC sensor off
+        s->set_aec2(s,         0);  // AEC DSP off
+        s->set_bpc(s,          0);  // BPC off
+        s->set_wpc(s,          0);  // WPC off
+        s->set_raw_gma(s,      0);  // Raw GMA off
+        s->set_lenc(s,         0);  // Lens correction off
+        ESP_LOGI(TAG, "센서 자동보정 전부 비활성화");
+    }
     return ESP_OK;
 }
 
@@ -176,8 +220,9 @@ static int two_pass_vonneumann(const uint8_t *bits, int len,
 int extract_bits_from_image(uint8_t *out_bits, int max_len)
 {
     // ════════════════════════════════════════════════════════
-    // [1단계] RGB JPEG 캡처 → RGBoriginal.jpg
+    // [1단계] RGB JPEG 캡처 → RGBoriginal.jpg  (디버그 전용)
     // ════════════════════════════════════════════════════════
+#ifdef PUF_DEBUG_SAVE
     if (sdcard_is_mounted()) {
         ESP_LOGI(TAG, "[1/4] RGB JPEG 캡처 (UXGA)...");
         if (camera_init_jpeg() == ESP_OK) {
@@ -194,14 +239,14 @@ int extract_bits_from_image(uint8_t *out_bits, int max_len)
             }
             esp_camera_deinit();
 
-            // deinit 후 PSRAM 여유 공간 확인
             ESP_LOGI(TAG, "PSRAM free after RGB deinit: %zu bytes",
                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            vTaskDelay(pdMS_TO_TICKS(100));  // 할당자 안정화 대기
+            vTaskDelay(pdMS_TO_TICKS(100));
         } else {
             ESP_LOGW(TAG, "RGB 초기화 실패, 건너뜀");
         }
     }
+#endif
 
     // ════════════════════════════════════════════════════════
     // [2단계] GRAYSCALE 캡처 → original.jpg
@@ -223,7 +268,9 @@ int extract_bits_from_image(uint8_t *out_bits, int max_len)
     int src_h = fb->height;
     ESP_LOGI(TAG, "GRAYSCALE 캡처 완료: %dx%d", src_w, src_h);
 
+#ifdef PUF_DEBUG_SAVE
     save_gray_as_jpeg(fb->buf, src_w, src_h, "original.jpg");
+#endif
 
     // ════════════════════════════════════════════════════════
     // [3단계] 리사이즈 → resized.jpg
@@ -248,7 +295,9 @@ int extract_bits_from_image(uint8_t *out_bits, int max_len)
     esp_camera_fb_return(fb);
     esp_camera_deinit();
 
+#ifdef PUF_DEBUG_SAVE
     save_gray_as_jpeg(resized_img, RESIZE_WIDTH, RESIZE_HEIGHT, "resized.jpg");
+#endif
 
     // ════════════════════════════════════════════════════════
     // [4단계] 임계값 처리 → threshold.jpg
@@ -269,7 +318,9 @@ int extract_bits_from_image(uint8_t *out_bits, int max_len)
     }
     free(resized_img);
 
+#ifdef PUF_DEBUG_SAVE
     save_gray_as_jpeg(threshold_img, RESIZE_WIDTH, RESIZE_HEIGHT, "threshold.jpg");
+#endif
     free(threshold_img);
 
     // ════════════════════════════════════════════════════════
@@ -283,13 +334,15 @@ int extract_bits_from_image(uint8_t *out_bits, int max_len)
         return -1;
     }
 
-    // vn_ext.txt — 추출된 비트 전체
+    // vn_ext.txt — 추출된 비트 전체 (디버그 전용)
+#ifdef PUF_DEBUG_SAVE
     if (sdcard_is_mounted()) {
         if (sdcard_write_bits("vn_ext.txt", out_bits, (size_t)out_len) == ESP_OK)
             ESP_LOGI(TAG, "vn_ext.txt 저장 완료 (%d bits)", out_len);
         else
             ESP_LOGW(TAG, "vn_ext.txt 저장 실패");
     }
+#endif
 
     // 통계 출력
     int ones = 0;

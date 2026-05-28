@@ -1,0 +1,550 @@
+#include "PiGatewayService.h"
+#include "FileUtils.h"
+
+#include <QDebug>
+#include <QByteArray>
+#include <QFile>
+#include <QStringList>
+#include <QSslSocket>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslError>
+#include <QCryptographicHash>
+
+namespace {
+constexpr quint16 kPiPort           = 5000;
+constexpr int     kConnectTimeoutMs = 5000;
+constexpr int     kWriteTimeoutMs   = 3000;
+constexpr int     kReadTimeoutMs    = 15000;
+constexpr int     kKeyWriteTimeoutMs = 30000;
+constexpr int     kKeyReadTimeoutMs  = 60000;
+}
+
+// 번들 CA 인증서 경로
+static constexpr QLatin1StringView kBundledCaCertResource{":/assets/certs/ca_cert.pem"};
+
+PiGatewayService::PiGatewayService()  = default;
+
+PiGatewayService::~PiGatewayService()
+{
+    closeSession();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS 소켓 설정 — 번들 Private CA로 서버 인증서 검증
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::configureSslSocket(QSslSocket *socket,
+                                          const QString & /*pinnedCertPath (미사용)*/,
+                                          QString *errorMessage) const
+{
+    QSslConfiguration sslConfig = QSslConfiguration::defaultConfiguration();
+    sslConfig.setProtocol(QSsl::TlsV1_3OrLater);
+
+    QFile caFile(kBundledCaCertResource);
+    if (!caFile.open(QIODevice::ReadOnly)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("번들 CA 인증서를 불러오지 못했습니다.\nassets/certs/ca_cert.pem 이 빌드에 포함되어 있는지 확인해주세요.");
+        return false;
+    }
+    const QSslCertificate caCert(&caFile, QSsl::Pem);
+    caFile.close();
+
+    if (caCert.isNull()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("번들 CA 인증서가 유효하지 않습니다.");
+        return false;
+    }
+
+    sslConfig.setCaCertificates({caCert});
+    sslConfig.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    socket->setSslConfiguration(sslConfig);
+    socket->setPeerVerifyName(QStringLiteral("vHSM-Pi"));
+
+    return true;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 단발성 TLS 연결 헬퍼
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::sendCommand(const QString &piHostOrName,
+                                   const QString &command,
+                                   QString *reply,
+                                   QString *errorMessage,
+                                   const QString &/*pinnedCertPath*/) const
+{
+    const QString trimmedHost = piHostOrName.trimmed();
+    if (trimmedHost.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("Pi IP를 입력해주세요.");
+        return false;
+    }
+
+    QSslSocket socket;
+    if (!configureSslSocket(&socket, QString(), errorMessage))
+        return false;
+
+    socket.connectToHostEncrypted(trimmedHost, kPiPort);
+    if (!socket.waitForEncrypted(kConnectTimeoutMs)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("TLS 연결에 실패했습니다.\n") + socket.errorString();
+        return false;
+    }
+
+    const QByteArray payload = (command + QStringLiteral("\n")).toUtf8();
+    if (socket.write(payload) == -1 || !socket.waitForBytesWritten(kWriteTimeoutMs)) {
+        if (errorMessage) *errorMessage = QStringLiteral("명령 전송에 실패했습니다.");
+        return false;
+    }
+
+    QByteArray buf;
+    while (true) {
+        if (!socket.waitForReadyRead(kReadTimeoutMs)) {
+            if (buf.isEmpty()) {
+                if (errorMessage) *errorMessage = QStringLiteral("Pi 서버 응답이 없습니다.");
+                return false;
+            }
+            break;
+        }
+        buf += socket.readAll();
+        if (buf.contains('\n')) break;
+    }
+
+    const int nl = buf.indexOf('\n');
+    if (reply) *reply = QString::fromUtf8(nl >= 0 ? buf.left(nl) : buf).trimmed();
+    if (errorMessage) errorMessage->clear();
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent 세션 소켓으로 커맨드 전송
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::sendSessionCommand(const QString &command,
+                                          QString *reply,
+                                          QString *errorMessage)
+{
+    if (!m_session || !m_session->isOpen()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("활성 세션이 없습니다. 다시 인증해주세요.");
+        return false;
+    }
+
+    const QByteArray payload = (command + QStringLiteral("\n")).toUtf8();
+    if (m_session->write(payload) == -1 || !m_session->waitForBytesWritten(kWriteTimeoutMs)) {
+        if (errorMessage) *errorMessage = QStringLiteral("세션 명령 전송에 실패했습니다.");
+        return false;
+    }
+
+    QByteArray buf;
+    while (true) {
+        if (!m_session->waitForReadyRead(kReadTimeoutMs)) {
+            if (buf.isEmpty()) {
+                if (errorMessage) *errorMessage = QStringLiteral("세션 응답 대기 시간이 초과되었습니다.");
+                return false;
+            }
+            break;
+        }
+        buf += m_session->readAll();
+        if (buf.contains('\n')) break;
+    }
+
+    const int nl = buf.indexOf('\n');
+    if (reply) *reply = QString::fromUtf8(nl >= 0 ? buf.left(nl) : buf).trimmed();
+    if (errorMessage) errorMessage->clear();
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 세션 관리
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::hasActiveSession() const
+{
+    return m_session && m_session->isOpen() && !m_sessionUser.isEmpty();
+}
+
+void PiGatewayService::closeSession()
+{
+    if (!m_session) return;
+
+    if (m_session->isOpen()) {
+        const QString cmd = QStringLiteral("SESSION_CLOSE:") + m_sessionUser;
+        m_session->write((cmd + QStringLiteral("\n")).toUtf8());
+        m_session->waitForBytesWritten(2000);
+        m_session->waitForReadyRead(2000);
+        m_session->disconnectFromHost();
+        m_session->waitForDisconnected(2000);
+    }
+
+    delete m_session;
+    m_session = nullptr;
+    m_sessionUser.clear();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Challenge-Response 인증 → Persistent 세션 수립
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::startAuthentication(const QString &userId,
+                                           const QString &piHostOrName,
+                                           const QByteArray &nonce,
+                                           QByteArray *piSignature,
+                                           QString *errorMessage)
+{
+    const QString trimmedUser = userId.trimmed();
+    const QString trimmedHost = piHostOrName.trimmed();
+
+    if (trimmedUser.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("유저명을 입력해주세요.");
+        return false;
+    }
+    if (nonce.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("Nonce 생성에 실패했습니다.");
+        return false;
+    }
+
+    closeSession();
+
+    auto *socket = new QSslSocket();
+    if (!configureSslSocket(socket, QString(), errorMessage)) {
+        delete socket;
+        return false;
+    }
+
+    socket->connectToHostEncrypted(trimmedHost, kPiPort);
+    if (!socket->waitForEncrypted(kConnectTimeoutMs)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("TLS 연결에 실패했습니다.\n") + socket->errorString();
+        delete socket;
+        return false;
+    }
+
+    const QString command = QStringLiteral("START_AUTH:%1:%2")
+                                .arg(trimmedUser, QString::fromLatin1(nonce.toBase64()));
+    const QByteArray payload = (command + QStringLiteral("\n")).toUtf8();
+    if (socket->write(payload) == -1 || !socket->waitForBytesWritten(kWriteTimeoutMs)) {
+        if (errorMessage) *errorMessage = QStringLiteral("인증 요청 전송에 실패했습니다.");
+        delete socket;
+        return false;
+    }
+
+    QByteArray buf;
+    while (true) {
+        if (!socket->waitForReadyRead(kReadTimeoutMs)) {
+            if (buf.isEmpty()) {
+                if (errorMessage) *errorMessage = QStringLiteral("Pi 인증 응답이 없습니다.");
+                delete socket;
+                return false;
+            }
+            break;
+        }
+        buf += socket->readAll();
+        if (buf.contains('\n')) break;
+    }
+
+    const int nl = buf.indexOf('\n');
+    const QString reply = QString::fromUtf8(nl >= 0 ? buf.left(nl) : buf).trimmed();
+
+    const QString prefix = QStringLiteral("AUTH_OK:");
+    if (!reply.startsWith(prefix)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("Pi 인증에 실패했습니다.\nPi 백엔드 로그를 확인해주세요.");
+        delete socket;
+        return false;
+    }
+
+    const QByteArray sig = QByteArray::fromBase64(reply.mid(prefix.size()).toUtf8());
+    if (sig.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("Pi 서명 디코딩에 실패했습니다.");
+        delete socket;
+        return false;
+    }
+
+    if (piSignature) *piSignature = sig;
+
+    m_session     = socket;
+    m_sessionUser = trimmedUser;
+
+    if (errorMessage) errorMessage->clear();
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 키 명령
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::sendKeyCommand(const QString &userId,
+                                      const QString &piHostOrName,
+                                      const QString &mode,
+                                      const QString &keyNumber,
+                                      const QString &data,
+                                      QString *resultData,
+                                      QString *errorMessage)
+{
+    const QString trimmedUser = userId.trimmed();
+    const QString trimmedMode = mode.trimmed().toLower();
+    const QString trimmedKey  = keyNumber.trimmed();
+
+    if (trimmedUser.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("유저명이 비어 있습니다.");
+        return false;
+    }
+    if (trimmedMode != QStringLiteral("encrypt") && trimmedMode != QStringLiteral("decrypt")) {
+        if (errorMessage) *errorMessage = QStringLiteral("알 수 없는 명령입니다.");
+        return false;
+    }
+    if (trimmedKey != QStringLiteral("1") && trimmedKey != QStringLiteral("2") && trimmedKey != QStringLiteral("3")) {
+        if (errorMessage) *errorMessage = QStringLiteral("키 번호는 1, 2, 3만 사용할 수 있습니다.");
+        return false;
+    }
+    if (!hasActiveSession()) {
+        if (errorMessage) *errorMessage = QStringLiteral("세션이 없습니다. 다시 인증해주세요.");
+        return false;
+    }
+
+    const QString command = QStringLiteral("KEY_COMMAND:%1:%2:%3:%4")
+                                .arg(trimmedUser, trimmedMode, trimmedKey, data.trimmed());
+
+    const QByteArray payload = (command + QStringLiteral("\n")).toUtf8();
+    if (m_session->write(payload) == -1 || !m_session->waitForBytesWritten(kKeyWriteTimeoutMs)) {
+        if (errorMessage) *errorMessage = QStringLiteral("키 명령 전송에 실패했습니다.");
+        return false;
+    }
+
+    QByteArray buf;
+    while (true) {
+        if (!m_session->waitForReadyRead(kKeyReadTimeoutMs)) {
+            if (buf.isEmpty()) {
+                if (errorMessage) *errorMessage = QStringLiteral("키 명령 응답 대기 시간이 초과되었습니다.");
+                return false;
+            }
+            break;
+        }
+        buf += m_session->readAll();
+        if (buf.contains('\n')) break;
+    }
+
+    const int nl = buf.indexOf('\n');
+    QString reply = QString::fromUtf8(nl >= 0 ? buf.left(nl) : buf).trimmed();
+
+    if (trimmedMode == QStringLiteral("encrypt") && reply.startsWith(QStringLiteral("KEY_ENCRYPT_OK:"))) {
+        if (resultData) *resultData = reply.mid(QString("KEY_ENCRYPT_OK:").length());
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (trimmedMode == QStringLiteral("decrypt") && reply.startsWith(QStringLiteral("KEY_DECRYPT_OK:"))) {
+        if (resultData) *resultData = reply.mid(QString("KEY_DECRYPT_OK:").length());
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+
+    if (errorMessage)
+        *errorMessage = reply.isEmpty() ? QStringLiteral("키 명령 처리에 실패했습니다.") : reply;
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 단발성 커맨드 구현
+// ─────────────────────────────────────────────────────────────────────────────
+bool PiGatewayService::provisionDevice(const QString &userId,
+                                       const QString &piHostOrName,
+                                       const QString &phonePublicKeyPem,
+                                       QString *piPublicKeyPem,
+                                       QString *piTlsCertPem,
+                                       QString *errorMessage) const
+{
+    const QString trimmedUser = userId.trimmed();
+    if (trimmedUser.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("유저명을 입력해주세요.");
+        return false;
+    }
+
+    const QString command = QStringLiteral("PROVISION_DEVICE:%1:%2")
+                                .arg(trimmedUser, QString::fromLatin1(phonePublicKeyPem.toUtf8().toBase64()));
+
+    QString reply;
+    if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+        return false;
+
+    const QString prefix = QStringLiteral("PROVISION_OK:");
+    if (!reply.startsWith(prefix)) {
+        if (errorMessage) *errorMessage = QStringLiteral("Pi 공개키 등록에 실패했습니다.");
+        return false;
+    }
+
+    const QStringList parts = reply.mid(prefix.size()).split(QLatin1Char(':'));
+    if (parts.size() != 2) {
+        if (errorMessage) *errorMessage = QStringLiteral("PROVISION 응답 형식 오류.");
+        return false;
+    }
+
+    const QByteArray decodedPub  = QByteArray::fromBase64(parts[0].toUtf8());
+    const QByteArray decodedCert = QByteArray::fromBase64(parts[1].toUtf8());
+
+    if (piPublicKeyPem) *piPublicKeyPem = QString::fromUtf8(decodedPub);
+    if (piTlsCertPem)   *piTlsCertPem   = QString::fromUtf8(decodedCert);
+    if (errorMessage)   errorMessage->clear();
+    return true;
+}
+
+bool PiGatewayService::loginUser(const QString &userId,
+                                 const QString &password,
+                                 const QString &piHostOrName,
+                                 QString *errorMessage,
+                                 QString *outRole)
+{
+    const QString trimmedUser = userId.trimmed();
+    const QString command     = QStringLiteral("LOGIN:%1:%2")
+                                .arg(trimmedUser, QString::fromLatin1(password.toUtf8().toBase64()));
+
+    QString reply;
+    if (hasActiveSession()) {
+        if (!sendSessionCommand(command, &reply, errorMessage))
+            return false;
+    } else {
+        if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+            return false;
+    }
+
+    if (reply.startsWith(QStringLiteral("LOGIN_OK"))) {
+        const int colon = reply.indexOf(QLatin1Char(':'));
+        if (outRole && colon >= 0)
+            *outRole = reply.mid(colon + 1).trimmed();
+        else if (outRole)
+            *outRole = QStringLiteral("public_user");
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+
+    if (errorMessage) {
+        if (reply.contains(QStringLiteral("INVALID_CREDENTIALS")))
+            *errorMessage = QStringLiteral("아이디 또는 비밀번호가 잘못되었습니다.");
+        else if (reply.contains(QStringLiteral("ROOT_OFFICER_CLI_ONLY")))
+            *errorMessage = QStringLiteral("Root Officer 계정은 앱 로그인이 불가합니다.\nPi CLI(admin_cli.py)를 통해 관리하세요.");
+        else
+            *errorMessage = QStringLiteral("로그인에 실패했습니다: ") + reply;
+    }
+    return false;
+}
+
+bool PiGatewayService::registerWithInvite(const QString &inviteCode,
+                                          const QString &newUserId,
+                                          const QString &password,
+                                          const QString &name,
+                                          const QString &email,
+                                          const QString &piHostOrName,
+                                          QString *errorMessage) const
+{
+    const QString command = QStringLiteral("REGISTER_WITH_INVITE:%1:%2:%3:%4:%5")
+    .arg(inviteCode.trimmed().toUpper(),
+         newUserId.trimmed(),
+         QString::fromLatin1(password.toUtf8().toBase64()),
+         QString::fromLatin1(name.trimmed().toUtf8().toBase64()),
+         QString::fromLatin1(email.trimmed().toUtf8().toBase64()));
+    QString reply;
+    if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+        return false;
+    if (reply == QStringLiteral("REGISTER_WITH_INVITE_OK")) {
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (errorMessage) {
+        if (reply.contains(QStringLiteral("INVALID_CODE")))
+            *errorMessage = QStringLiteral("유효하지 않은 초대 코드입니다.");
+        else if (reply.contains(QStringLiteral("CODE_ALREADY_USED")))
+            *errorMessage = QStringLiteral("이미 사용된 초대 코드입니다.");
+        else if (reply.contains(QStringLiteral("CODE_EXPIRED")))
+            *errorMessage = QStringLiteral("만료된 초대 코드입니다.");
+        else if (reply.contains(QStringLiteral("ALREADY_EXISTS")))
+            *errorMessage = QStringLiteral("이미 사용 중인 아이디입니다.");
+        else
+            *errorMessage = QStringLiteral("가입 실패: ") + reply;
+    }
+    return false;
+}
+
+bool PiGatewayService::getAuditLog(const QString &userId,
+                                   const QString &piHostOrName,
+                                   QString *outJson,
+                                   QString *errorMessage)
+{
+    const QString command = QStringLiteral("GET_AUDIT_LOG:%1").arg(userId.trimmed());
+    QString reply;
+    if (!sendSessionCommand(command, &reply, errorMessage))
+        return false;
+    const QString prefix = QStringLiteral("AUDIT_LOG_OK:");
+    if (reply.startsWith(prefix)) {
+        const QByteArray decoded = QByteArray::fromBase64(reply.mid(prefix.size()).toUtf8());
+        if (outJson) *outJson = QString::fromUtf8(decoded);
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (errorMessage)
+        *errorMessage = reply.contains(QStringLiteral("PERMISSION_DENIED"))
+                            ? QStringLiteral("감사 로그 접근 권한이 없습니다.")
+                            : QStringLiteral("감사 로그 조회 실패: ") + reply;
+    return false;
+}
+
+bool PiGatewayService::findUserId(const QString &name,
+                                  const QString &piHostOrName,
+                                  QString *foundUserId,
+                                  QString *errorMessage) const
+{
+    const QString command = QStringLiteral("FIND_ID:%1")
+    .arg(QString::fromLatin1(name.trimmed().toUtf8().toBase64()));
+    QString reply;
+    if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+        return false;
+    const QString prefix = QStringLiteral("FIND_ID_OK:");
+    if (reply.startsWith(prefix)) {
+        if (foundUserId) *foundUserId = reply.mid(prefix.size()).trimmed();
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (errorMessage)
+        *errorMessage = reply.contains(QStringLiteral("NOT_FOUND"))
+                            ? QStringLiteral("일치하는 계정을 찾을 수 없습니다.")
+                            : QStringLiteral("아이디 찾기 실패: ") + reply;
+    return false;
+}
+
+bool PiGatewayService::findPasswordCheck(const QString &userId,
+                                         const QString &name,
+                                         const QString &piHostOrName,
+                                         QString *errorMessage) const
+{
+    const QString command = QStringLiteral("FIND_PASSWORD:%1:%2")
+    .arg(userId.trimmed(),
+         QString::fromLatin1(name.trimmed().toUtf8().toBase64()));
+    QString reply;
+    if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+        return false;
+    if (reply == QStringLiteral("FIND_PASSWORD_OK")) {
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (errorMessage)
+        *errorMessage = reply.contains(QStringLiteral("NOT_FOUND"))
+                            ? QStringLiteral("이름과 아이디가 일치하는 계정을 찾을 수 없습니다.")
+                            : QStringLiteral("계정 확인 실패: ") + reply;
+    return false;
+}
+
+bool PiGatewayService::resetPassword(const QString &userId,
+                                     const QString &newPassword,
+                                     const QString &piHostOrName,
+                                     QString *errorMessage) const
+{
+    const QString command = QStringLiteral("RESET_PASSWORD:%1:%2")
+    .arg(userId.trimmed(),
+         QString::fromLatin1(newPassword.toUtf8().toBase64()));
+    QString reply;
+    if (!sendCommand(piHostOrName, command, &reply, errorMessage))
+        return false;
+    if (reply == QStringLiteral("RESET_PASSWORD_OK")) {
+        if (errorMessage) errorMessage->clear();
+        return true;
+    }
+    if (errorMessage)
+        *errorMessage = reply.contains(QStringLiteral("NOT_FOUND"))
+                            ? QStringLiteral("해당 계정을 찾을 수 없습니다.")
+                            : QStringLiteral("비밀번호 재설정 실패: ") + reply;
+    return false;
+}

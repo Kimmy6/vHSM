@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 
@@ -41,25 +42,28 @@ void app_main(void)
     flash_led_off();
 
     while (1) {
-        // 대기 상태 진입 시 1번만 출력
-        printf("READY\r\n");
-        fflush(stdout);
-
-        // G가 올 때까지 대기
+        // Pi4에서 "GO\r\n" 전체 수신 시에만 트리거
+        // 단일 'G' 매칭은 Pi 부팅 로그(GPIO, Booting 등)에 의한 오트리거 발생
         while (1) {
-            int c = getchar();
+            printf("READY\r\n");
+            fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(200));
 
-            if (c == EOF || c < 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
+            // 줄 단위로 읽어 "GO" 여부 확인
+            char line[16] = {0};
+            int  idx = 0;
+            int  c;
+            while (idx < (int)(sizeof(line) - 1)) {
+                c = getchar();
+                if (c == EOF || c < 0) break;
+                if (c == '\n') break;
+                if (c != '\r') line[idx++] = (char)c;
             }
+            line[idx] = '\0';
 
-            // 줄바꿈 문자는 무시
-            if (c == '\r' || c == '\n') {
-                continue;
-            }
-
-            if (c == 'G') {
+            if (strcmp(line, "GO") == 0) {
+                printf("GO_RECEIVED\r\n");
+                fflush(stdout);
                 break;
             }
         }
@@ -103,6 +107,11 @@ void app_main(void)
         fflush(stdout);
 
         free(bits_buf);
+
+        // 키 전송 완료 후 소프트 리셋 — 매 캡처마다 완전히 새로운 상태에서 시작
+        vTaskDelay(pdMS_TO_TICKS(100));  // UART 버퍼 flush 대기
+        esp_restart();
+        
     }
 
     if (sd_ready) {
